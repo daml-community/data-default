@@ -1,0 +1,47 @@
+-- | A class for types with a default value, after the Hackage package
+-- @data-default@.
+module Data.Default
+  ( Default(..)
+  ) where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Monoid (All, Any, Endo, Product, Sum)
+import DA.Set (Set)
+import DA.Set qualified as Set
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+
+-- | A class for types with a default value.
+class Default a where
+  -- | The default value for this type.
+  def : a
+
+instance Default () where def = ()
+instance Default Bool where def = False
+instance Default Ordering where def = EQ
+instance Default Int where def = 0
+instance NumericScale n => Default (Numeric n) where def = intToNumeric 0
+instance Default Text where def = ""
+instance Default (Optional a) where def = None
+instance Default [a] where def = []
+instance Default (Map keyType valueType) where def = Map.empty
+instance Default (Set element) where def = Set.empty
+instance Default (TextMap valueType) where def = TextMap.empty
+instance Default result => Default (argument -> result) where def = const def
+instance Default a => Default (Update a) where def = pure def
+instance Default All where def = mempty
+instance Default Any where def = mempty
+instance Default (Endo a) where def = mempty
+instance Additive a => Default (Sum a) where def = mempty
+instance Multiplicative a => Default (Product a) where def = mempty
+
+instance (Default a, Default b) => Default (a, b) where
+  def = (def, def)
+instance (Default a, Default b, Default c) => Default (a, b, c) where
+  def = (def, def, def)
+instance (Default a, Default b, Default c, Default d) => Default (a, b, c, d) where
+  def = (def, def, def, def)
+instance (Default a, Default b, Default c, Default d, Default e)
+    => Default (a, b, c, d, e) where
+  def = (def, def, def, def, def)
