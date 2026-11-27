@@ -1,0 +1,114 @@
+name: PR build
+
+# Runs on GitHub-hosted runners, deliberately. This repo is public, and for
+# `pull_request` GitHub uses the workflow file from the PR's head -- so a fork
+# author controls every step. Keeping that on a disposable VM means it has
+# nothing to reach: no signing key, no instance credentials, no shared disk.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  dpm-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # The default shell is `bash -e` without pipefail, which lets the left-hand
+    # side of a pipeline fail silently -- `curl ... | sh` below would pass on a
+    # failed download. This adds -o pipefail to every run step.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needed to diff against the base commit below.
+          fetch-depth: 0
+
+      # The DAR is named <name>-<version>.dar and carries no other identity, so
+      # changing the package without bumping the version produces a second,
+      # differently-signed artifact claiming to be the same release. (Daml's
+      # real identity is the package ID, a content hash, so the two are
+      # distinguishable after the fact -- but anyone fetching "0.0.1" by name
+      # is not.) Make the bump a reviewed decision rather than a remembered one.
+      - name: Require a version bump when the package changes
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+
+          changed=no
+          if ! git diff --quiet "$base" HEAD -- daml/; then
+            changed=yes
+          fi
+          # daml.yaml also affects the built package (dependencies, sdk-version
+          # and so on). Any change to it except the version line itself counts.
+          if git diff "$base" HEAD -- daml.yaml \
+            | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -qvE '^[+-]version:'; then
+            changed=yes
+          fi
+
+          if [ "$changed" = no ]; then
+            echo "no package changes; version bump not required"
+            exit 0
+          fi
+
+          old=$(git show "$base:daml.yaml" | sed -n 's/^version:[[:space:]]*//p' | tr -d '"')
+          new=$(sed -n 's/^version:[[:space:]]*//p' daml.yaml | tr -d '"')
+          if [ "$old" = "$new" ]; then
+            echo "::error file=daml.yaml::package changed but version is still $new -- bump it" >&2
+            exit 1
+          fi
+          echo "version bumped: $old -> $new"
+
+      - name: Read the pinned SDK version from daml.yaml
+        id: sdk
+        run: |
+          version=$(sed -n 's/^sdk-version:[[:space:]]*//p' daml.yaml | tr -d '"')
+          if [ -z "$version" ]; then
+            echo "no sdk-version in daml.yaml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The SDK bundle is ~1GB. Cache it on the pinned version so it is fetched
+      # once per SDK release rather than on every push to a PR.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.dpm
+          key: dpm-${{ runner.os }}-sdk-${{ steps.sdk.outputs.version }}
+
+      # Install the exact SDK daml.yaml pins, rather than whatever is current.
+      # That bundles its own dpm, so this build uses the toolchain the project
+      # declares -- the same one `dpm install` resolves on the signing runner.
+      - name: Install the pinned SDK
+        run: |
+          if [ ! -x "$HOME/.dpm/bin/dpm" ]; then
+            curl -fsSL https://get.digitalasset.com/install/install.sh \
+              | sh -s "${{ steps.sdk.outputs.version }}"
+          fi
+          echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: dpm build
+
+      - name: Confirm a DAR was produced
+        run: |
+          shopt -s nullglob
+          dars=(.daml/dist/*.dar)
+          if [ ${#dars[@]} -eq 0 ]; then
+            echo "dpm build produced no .dar in .daml/dist" >&2
+            exit 1
+          fi
+          printf 'built: %s\n' "${dars[@]}"

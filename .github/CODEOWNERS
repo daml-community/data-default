@@ -1,0 +1,12 @@
+# Workflows under .github/ get privileged execution: sign.yml runs on the
+# self-hosted runner that holds the "Obsidian Systems" signing key, on every
+# merge to main. A change here is therefore a change to what runs next to that
+# key, so it needs a named reviewer rather than a casual approval.
+#
+# This gates merging only. It has no bearing on fork pull requests, which never
+# merge -- those are governed by the fork-approval setting under
+# Settings -> Actions -> General.
+#
+# Both maintainers are listed so either can review the other's CI changes;
+# GitHub does not let an author approve their own pull request.
+/.github/        @manuel-os-work @patrickaldis

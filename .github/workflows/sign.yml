@@ -1,0 +1,124 @@
+name: Build and sign
+
+# Merges to main and manual runs only. This job runs on the self-hosted runner,
+# which holds the signing key as a file on disk, so it must never be reachable
+# from a fork pull request -- the repo is public. Reaching main requires a
+# reviewed PR under the branch ruleset, so only reviewed code runs here. PR
+# validation lives in pr-build.yml and uses GitHub-hosted runners for exactly
+# that reason.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# contents: write is needed to create the release and its tag. Nothing else
+# here writes to the repository -- no commits are pushed.
+permissions:
+  contents: write
+
+concurrency:
+  group: sign-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-sign:
+    runs-on: [self-hosted, nixos, dpm]
+    timeout-minutes: 30
+
+    # The default shell is `bash -e` without pipefail, which lets the left-hand
+    # side of a pipeline fail silently. This adds -o pipefail to every run step.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Pinned to a commit, not a tag: these run on the self-hosted runner that
+      # holds the signing key, and tags are mutable -- a compromised `v7` would
+      # be code execution as the runner user. v7 also matches the runner's
+      # nodeRuntimes (node24); the v4 line needs node20, which it does not ship.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # dpm itself comes from the runner's Nix closure -- nothing to install.
+      # This only fetches the SDK version pinned in daml.yaml, cached in
+      # DPM_HOME across jobs.
+      - name: Install the SDK pinned in daml.yaml
+        run: dpm install
+
+      - name: Build
+        run: dpm build
+
+      - name: Sign
+        env:
+          SIGNING_KEY: C5B6846515DFF818871F13FB9A2684600F2DE930
+        run: |
+          shopt -s nullglob
+          dars=(.daml/dist/*.dar)
+          if [ ${#dars[@]} -eq 0 ]; then
+            echo "dpm build produced no .dar in .daml/dist" >&2
+            exit 1
+          fi
+          for f in "${dars[@]}"; do
+            gpg --batch --yes --local-user "$SIGNING_KEY" --detach-sign --armor "$f"
+          done
+
+      - name: Verify the signatures we just made
+        run: |
+          for f in .daml/dist/*.dar; do
+            gpg --verify "$f.asc" "$f"
+          done
+
+      # Kept for merges that do not publish: evidence the build still signs
+      # cleanly. Expires, and is not a distribution channel.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: data-default-signed
+          path: |
+            .daml/dist/*.dar
+            .daml/dist/*.asc
+          if-no-files-found: error
+
+      - name: Read the package version
+        id: pkg
+        run: |
+          version=$(sed -n 's/^version:[[:space:]]*//p' daml.yaml | tr -d '"')
+          if [ -z "$version" ]; then
+            echo "no version in daml.yaml" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The version in daml.yaml is what decides whether this merge is a
+      # release. A PR that changes the package must bump it (enforced by
+      # pr-build.yml), so a new version here means new code to publish. A merge
+      # that touched only docs or CI carries the version that is already
+      # released, and this step does nothing.
+      - name: Publish a release if this version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.pkg.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; nothing to publish"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes \
+            --notes-file - \
+            .daml/dist/*.dar .daml/dist/*.asc <<'NOTES'
+          Signed with the Obsidian Systems release key,
+          fingerprint `C5B6 8465 15DF F818 871F  13FB 9A26 8460 0F2D E930`.
+
+          To verify:
+
+          ```
+          # keyserver.ubuntu.com only answers op=get by long key id, not by
+          # full fingerprint, so fetch by id and then check the fingerprint.
+          gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 9A2684600F2DE930
+          gpg --fingerprint 9A2684600F2DE930
+          # expect: C5B6 8465 15DF F818 871F  13FB 9A26 8460 0F2D E930
+
+          gpg --verify data-default-*.dar.asc data-default-*.dar
+          ```
+          NOTES
